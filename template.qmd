@@ -1,6 +1,6 @@
 ---
 title: "Lab 5: Sea-Level Rise"
-author: "<Your Name (NetID)>"
+author: "<Grant Parajuli, gap6"
 jupyter: julia-1.10
 date: 2024-02-16
 
@@ -9,18 +9,18 @@ format:
 
     # YOU DO NOT NEED BOTH PDF AND DOCX.
     # COMMENT OR DELETE THE ONE YOU DON'T WANT TO USE.
-    pdf:
-        documentclass: article
-        fontsize: 11pt
-        geometry:
-            - margin=1in  
-        number-sections: true
-        code-line-numbers: true
-    #docx: 
-    #    toc: true
-    #    fig-format: png
-    #    number-sections: true
-    #    code-line-numbers: true
+    # pdf:
+    #     documentclass: article
+    #     fontsize: 11pt
+    #     geometry:
+    #         - margin=1in  
+    #     number-sections: true
+    #     code-line-numbers: true
+    docx: 
+       toc: true
+       fig-format: png
+       number-sections: true
+       code-line-numbers: true
 
 date-format: "ddd., MMM. D"
 bibliography: references.bib
@@ -60,3 +60,190 @@ Plots.default(; margin=5Plots.mm)
 using Revise
 using HouseElevation
 ```
+
+# Question 1
+
+Build house object for Willie G's steakhouse.
+```{julia}
+house = let
+    haz_fl_dept = CSV.read("data/haz_fl_dept.csv", DataFrame) # read in the file
+    desc = "Cafeteria Restaurant, structure"
+    row = @rsubset(haz_fl_dept, :Description == desc)[1, :] # depth damage curve for restaurant structure
+    area = 1200u"ft^2" # rough estimate. They have a ballroom that can have 100 guests (usually need 6x as much square footage for the space required) then I'll assume the rest of kitchen space and dining area is about double that (might be bigger or smaller)
+    height_above_gauge = 9u"ft" # should be 9.3 but got weird float error
+    House(
+        row;
+        area=area,
+        height_above_gauge=height_above_gauge,
+        value_usd=1_200_000
+    )
+end
+```
+
+Depth-damage plot.
+```{julia}
+#| code-fold: true
+let
+    depths = uconvert.(u"ft", (-7.0u"ft"):(1.0u"inch"):(30.0u"ft"))
+    damages = house.ddf.(depths) ./ 100 .* house.value_usd ./ 1000 # I added a /100 here since my depth-damage curve reports in full percents
+    scatter(
+        depths,
+        damages;
+        xlabel="Flood Depth",
+        ylabel="Damage (Thousand USD)",
+        label="$(house.description)\n($(house.source))",
+        legend=:bottomright,
+        size=(800, 400),
+        yformatter=:plain, # prevents scientific notation
+    )
+end
+```
+
+Plot cost of elevating for 0ft elevation to 14ft elevation.
+```{julia}
+let
+    elevations = 0u"ft":0.25u"ft":14u"ft"
+    costs = [elevation_cost(house, eᵢ) for eᵢ in elevations]
+    scatter(
+        elevations,
+        costs ./ 1_000;
+        xlabel="Elevation",
+        ylabel="Cost (Thousand USD)",
+        label="$(house.description)\n($(house.source))",
+        legend=:bottomright,
+        size=(800, 400),
+        yformatter=:plain, # prevents scientific notation
+    )
+end
+```
+
+Read in sea level rise data.
+```{julia}
+slr_scenarios = let
+    df = CSV.read("data/slr_oddo.csv", DataFrame)
+    [Oddo17SLR(a, b, c, tstar, cstar) for (a, b, c, tstar, cstar) in eachrow(df)]
+end
+```
+
+Draw samples of storm surge/discount rate. The storm surge dsitribution is based on the one we had in lab 3. I don't want to adjust the discount rate uncertainty too much since I expect it to be a fairly sensitive parameter. Even std of 0.02 might be too high.
+```{julia}
+function draw_surge_distribution()
+    μ = rand(Normal(5, 1))
+    σ = rand(Exponential(1.5))
+    ξ = rand(Normal(0.1, 0.05))
+    GeneralizedExtremeValue(μ, σ, ξ)
+end
+
+function draw_discount_rate()
+    return rand(Normal(0.04, 0.02))
+end
+```
+
+Run a simulation. I used an illustrative action of an 8ft house elevation. The model parameters are the house object created above and I'll examine until the year 2100. A surge distribution, discount rate, and sea level rise scenario are all randomly drawn.
+```{julia}
+p = ModelParams(
+    house=house,
+    years=2024:2100
+)
+
+a = Action(8.0u"ft")
+
+sow = SOW(
+    rand(slr_scenarios),
+    draw_surge_distribution(),
+    draw_discount_rate()
+)
+
+res = run_sim(a, sow, p)
+```
+
+## Large ensemble
+
+Sample many SOWs.
+```{julia}
+sows = [SOW(rand(slr_scenarios), draw_surge_distribution(), draw_discount_rate()) for _ in 1:10] # for 10 SOWs
+actions = [Action(8.0u"ft") for _ in 1:10] # these are all the same
+results = [run_sim(a, s, p) for (a, s) in zip(actions, sows)]
+
+df = DataFrame(
+    npv=results,
+    Δh_ft=[a.Δh_ft for a in actions],
+    slr_a=[s.slr.a for s in sows],
+    slr_b=[s.slr.b for s in sows],
+    slr_c=[s.slr.c for s in sows],
+    slr_tstar=[s.slr.tstar for s in sows],
+    slr_cstar=[s.slr.cstar for s in sows],
+    surge_μ=[s.surge_dist.μ for s in sows],
+    surge_σ=[s.surge_dist.σ for s in sows],
+    surge_ξ=[s.surge_dist.ξ for s in sows],
+    discount_rate=[s.discount_rate for s in sows],
+)
+```
+
+Now I'll analyze this data. First, let's plot the npv for all of the scenarios.
+
+```{julia}
+npv_data = [df[i, :npv] for i in 1:nrow(df)]
+
+plot(npv_data, xlabel="Simulation", ylabel="Value", title="npv (USD)", legend=false)
+```
+
+From this plot, the simulations have a roughly similar NPV, except for simulation 2. In my original on-mac code, simulation 2 was a factor of 10 more expensive than the others. I'll try and find out why.
+
+Let's analyze the SLR scenarios for each of these simulations.
+
+I'll plot the simulations vs. their discount rate. Since we're examining over a 76 year period, I'd expect this to be very important for determining relative NPVs.
+```{julia}
+discounts = [df[i, :discount_rate] for i in 1:nrow(df)]
+
+scatter(discounts, npv_data, xlabel="Discount Rate", ylabel="NPV (USD)", title="Net Present Value for each simulation's discount rate", legend=false)
+```
+
+My hypothesis was right. The discount rate for this very high cost scenario was extremely low and almost 0, only a few fractions of a percent. As there is a lot of debate about if we should discount future climate change at all, this exercise shows that if we barely discount future costs at all, the difference in cost scenarios is absolutely huge. Future losses become very, very important and compound together if they aren't discounted. I'll exclude this scenario for now since it will skew the analysis of the other scenarios, but it's worth exploring.
+
+```{julia}
+delete!(df, 2)
+```
+
+```{julia}
+npv_data = [df[i, :npv] for i in 1:nrow(df)]
+
+plot(npv_data, xlabel="Simulation", ylabel="Value", title="npv (USD)", legend=false)
+```
+
+Now there's a new high npv scenario. 
+
+```{julia}
+discounts = [df[i, :discount_rate] for i in 1:nrow(df)]
+
+scatter(discounts, npv_data, xlabel="Discount Rate", ylabel="NPV (USD)", title="Net Present Value for each simulation's discount rate", legend=false)
+```
+
+Interestingly, this scenario occurs when we have a high discount rate. A high discount rate should lower future costs. Let's check the other parameters that get us to a high NPV loss, first from the surge distribution.
+
+```{julia}
+row_idx = findall(df[:, 11] .> 0.08) # index for the high discount rate experiment, which has parameters I'll highlight
+
+scatter(df[:, "surge_μ"], label="Surge μ")
+scatter!(row_idx, df[row_idx, "surge_μ"], color=:red, label="High npv value")
+```
+
+```{julia}
+scatter(df[:, "surge_σ"], label="Surge σ")
+scatter!(row_idx, df[row_idx, "surge_σ"], color=:red, label="High npv value")
+```
+
+```{julia}
+scatter(df[:, "surge_ξ"], label="Surge ξ")
+scatter!(row_idx, df[row_idx, "surge_ξ"], color=:red, label="High npv value")
+```
+
+As we see here, this experiment has a pretty normal μ, but a very high σ and a comparatively low ξ. The high deviation could likely cause us to see a very dangerous extreme storm surge that would cause a lot of damage even with our elevation. I'm pretty sure the low shape parameter makes the tail even fatter as well, making it even more likely to get a high storm surge.
+
+These are the effects of a couple of the parameters. I didn't have time to look at all of the sea level rise model parameter, but these showed some important parameters. I would say the "best" (cheapest) results come from a high discount rate in combination with a storm surge distribution with the lowest possible frequencies of high flooding events. Even if there are very high flooding events, they will have such a high return period that they won't impact our costs too much. 
+
+The worst results came from applying low discount rates, or having high return levels for lower return period events. Thus, I think the standard deviation and shape parameters of the GEV are very important, as well as the discount rate. 
+
+If I had unlimited computing power, I would just look at more combinations of parameters and assumptions. Here I only used 10 samples, so we could theoretically sample 1000s of SOWs, surge distributions, and discount rates. I don't really know what exact number would be enough or too much, but with unlimited computing power, you could technically sample almost everything possible to discover all the edge cases.
+
+In decision making, the uncertainty in the storm surge distribution and the discount rate should be quantified. Any assumptions for all of these parameters should significantly affect the way you make a decision based on this information. As such, policies that rely only on something like a mean value without considering uncertainty should not be implemented.
